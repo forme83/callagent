@@ -1,0 +1,902 @@
+import { Injectable } from '@nestjs/common';
+import fetch from 'node-fetch';
+import WebSocket from 'ws';
+import { CallsService } from './calls.service';
+import { AiOperatorService } from './ai-operator.service';
+import { TelnyxService } from './telnyx.service';
+
+type SttConnectionState = 'idle' | 'opening' | 'open' | 'closed' | 'error';
+
+interface RealtimeServerEvent {
+  type?: string;
+  delta?: string;
+  transcript?: string;
+  item_id?: string;
+  error?: any;
+  session?: any;
+}
+
+interface StreamingSessionState {
+  totalBytes: number;
+  chunkCount: number;
+  isClosing: boolean;
+  startedAt: number;
+  lastChunkAt: number;
+  ws: WebSocket | null;
+  sttConnectionState: SttConnectionState;
+  lastPartialText: string;
+  lastFinalText: string;
+  lastHandledText: string;
+  pendingFinalText: string;
+  isHandlingTurn: boolean;
+  isBotSpeaking: boolean;
+  botSpeakingTimeout: NodeJS.Timeout | null;
+  wasInterruptedByHuman: boolean;
+  interruptInFlight: boolean;
+  fastStartUsed: boolean;
+  fastStartPartialText: string;
+}
+
+@Injectable()
+export class StreamingSttService {
+  private sessions = new Map<string, StreamingSessionState>();
+
+  constructor(
+    private readonly callsService: CallsService,
+    private readonly aiOperatorService: AiOperatorService,
+    private readonly telnyxService: TelnyxService,
+  ) {}
+
+  startSession(callControlId: string) {
+    const existing = this.sessions.get(callControlId);
+
+    if (existing) {
+      this.closeRealtimeSession(callControlId, existing);
+      this.clearBotSpeakingTimeout(existing);
+    }
+
+    const session: StreamingSessionState = {
+      totalBytes: 0,
+      chunkCount: 0,
+      isClosing: false,
+      startedAt: Date.now(),
+      lastChunkAt: 0,
+      ws: null,
+      sttConnectionState: 'idle',
+      lastPartialText: '',
+      lastFinalText: '',
+      lastHandledText: '',
+      pendingFinalText: '',
+      isHandlingTurn: false,
+      isBotSpeaking: false,
+      botSpeakingTimeout: null,
+      wasInterruptedByHuman: false,
+      interruptInFlight: false,
+      fastStartUsed: false,
+      fastStartPartialText: '',
+    };
+
+    this.sessions.set(callControlId, session);
+
+    console.log('STREAMING STT START SESSION:', callControlId);
+
+    this.openRealtimeSession(callControlId, session);
+  }
+
+  pushAudio(callControlId: string, chunk: Buffer) {
+    const session = this.sessions.get(callControlId);
+
+    if (!session) {
+      console.log('STREAMING STT PUSH AUDIO: session not found', {
+        callControlId,
+        bytes: chunk.length,
+      });
+      return;
+    }
+
+    if (session.isClosing) {
+      console.log('STREAMING STT PUSH AUDIO: session closing, chunk ignored', {
+        callControlId,
+        bytes: chunk.length,
+      });
+      return;
+    }
+
+    session.totalBytes += chunk.length;
+    session.chunkCount += 1;
+    session.lastChunkAt = Date.now();
+
+    this.sendAudioChunk(callControlId, session, chunk);
+  }
+
+  stopSession(callControlId: string) {
+    const session = this.sessions.get(callControlId);
+
+    if (session) {
+      session.isClosing = true;
+
+      this.clearBotSpeakingTimeout(session);
+
+      setTimeout(() => {
+        this.closeRealtimeSession(callControlId, session);
+      }, 300);
+
+      console.log('STREAMING STT STOP SESSION SUMMARY:', {
+        callControlId,
+        totalBytes: session.totalBytes,
+        chunkCount: session.chunkCount,
+        lifetimeMs: Date.now() - session.startedAt,
+        lastChunkAgoMs: session.lastChunkAt ? Date.now() - session.lastChunkAt : null,
+        sttConnectionState: session.sttConnectionState,
+        lastPartialText: session.lastPartialText,
+        lastFinalText: session.lastFinalText,
+        lastHandledText: session.lastHandledText,
+        pendingFinalText: session.pendingFinalText,
+        isHandlingTurn: session.isHandlingTurn,
+        isBotSpeaking: session.isBotSpeaking,
+        wasInterruptedByHuman: session.wasInterruptedByHuman,
+        interruptInFlight: session.interruptInFlight,
+        fastStartUsed: session.fastStartUsed,
+        fastStartPartialText: session.fastStartPartialText,
+      });
+
+      this.sessions.delete(callControlId);
+    }
+
+    console.log('STREAMING STT STOP SESSION:', callControlId);
+  }
+
+  markBotSpeaking(callControlId: string) {
+    const session = this.sessions.get(callControlId);
+
+    if (!session) {
+      console.log('STREAMING STT MARK BOT SPEAKING: session not found', {
+        callControlId,
+      });
+      return;
+    }
+
+    this.clearBotSpeakingTimeout(session);
+    session.isBotSpeaking = true;
+    session.wasInterruptedByHuman = false;
+
+    console.log('STREAMING STT BOT SPEAKING STARTED:', {
+      callControlId,
+    });
+  }
+
+  markBotStopped(callControlId: string) {
+    const session = this.sessions.get(callControlId);
+
+    if (!session) {
+      console.log('STREAMING STT MARK BOT STOPPED: session not found', {
+        callControlId,
+      });
+      return;
+    }
+
+    this.clearBotSpeakingTimeout(session);
+    session.wasInterruptedByHuman = false;
+    session.interruptInFlight = false;
+
+    console.log('STREAMING STT BOT SPEAKING STOPPED:', {
+      callControlId,
+    });
+  }
+
+  async forceInterrupt(callControlId: string) {
+    const session = this.sessions.get(callControlId);
+
+    if (!session) {
+      console.log('STREAMING STT INTERRUPT SKIPPED: session not found', {
+        callControlId,
+      });
+      return;
+    }
+
+    if (session.interruptInFlight) {
+      console.log('STREAMING STT INTERRUPT SKIPPED: already in flight', {
+        callControlId,
+      });
+      return;
+    }
+
+    session.interruptInFlight = true;
+    session.wasInterruptedByHuman = true;
+
+    try {
+      await this.telnyxService.stopSpeak(callControlId);
+    } catch (err) {
+      console.error('STREAMING STT INTERRUPT ERROR:', {
+        callControlId,
+        err,
+      });
+    } finally {
+      this.clearBotSpeakingTimeout(session);
+      session.interruptInFlight = false;
+    }
+
+    console.log('STREAMING STT INTERRUPT DONE:', {
+      callControlId,
+    });
+  }
+
+  private openRealtimeSession(callControlId: string, session: StreamingSessionState) {
+    const apiKey = process.env.OPENAI_API_KEY;
+
+    if (!apiKey) {
+      console.error('OPENAI_API_KEY not set');
+      session.sttConnectionState = 'error';
+      return;
+    }
+
+    session.sttConnectionState = 'opening';
+
+    const ws = new WebSocket('wss://api.openai.com/v1/realtime?intent=transcription', {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+      },
+    });
+
+    session.ws = ws;
+
+    ws.on('open', () => {
+      session.sttConnectionState = 'open';
+
+      console.log('STREAMING STT WS OPEN:', { callControlId });
+
+      ws.send(JSON.stringify({
+        type: 'session.update',
+        session: {
+          type: 'transcription',
+          audio: {
+            input: {
+              format: {
+                type: 'audio/pcma'
+              },
+              transcription: {
+                model: 'gpt-4o-transcribe',
+                language: 'es'
+              },
+              turn_detection: {
+                type: 'server_vad',
+                threshold: 0.5,
+                prefix_padding_ms: 300,
+                silence_duration_ms: 500
+              }
+            }
+          }
+        }
+      }));
+    });
+
+    ws.on('message', (data: WebSocket.RawData) => {
+      try {
+        const parsed = JSON.parse(data.toString()) as RealtimeServerEvent;
+        this.handleRealtimeMessage(callControlId, session, parsed);
+      } catch (err) {
+        console.error('STREAMING STT WS PARSE ERROR:', {
+          callControlId,
+          err,
+        });
+      }
+    });
+
+    ws.on('close', (code: number, reason: Buffer) => {
+      session.sttConnectionState = 'closed';
+
+      console.log('STREAMING STT WS CLOSED:', {
+        callControlId,
+        code,
+        reason: reason.toString(),
+      });
+    });
+
+    ws.on('error', (err: Error) => {
+      session.sttConnectionState = 'error';
+
+      console.error('STREAMING STT WS ERROR:', {
+        callControlId,
+        err,
+      });
+    });
+  }
+
+  private sendAudioChunk(
+    callControlId: string,
+    session: StreamingSessionState,
+    chunk: Buffer,
+  ) {
+    if (!session.ws || session.ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    session.ws.send(JSON.stringify({
+      type: 'input_audio_buffer.append',
+      audio: chunk.toString('base64'),
+    }));
+  }
+
+  private handleRealtimeMessage(
+    callControlId: string,
+    session: StreamingSessionState,
+    event: RealtimeServerEvent,
+  ) {
+    const eventType = event?.type ?? '';
+
+    if (!eventType) {
+      console.log('STREAMING STT EVENT WITHOUT TYPE:', {
+        callControlId,
+        event,
+      });
+      return;
+    }
+
+    if (eventType === 'session.created') {
+      console.log('STREAMING STT SESSION CREATED FULL:', {
+        callControlId,
+        event,
+      });
+      return;
+    }
+
+    if (
+      eventType === 'session.updated' ||
+      eventType === 'input_audio_buffer.speech_started' ||
+      eventType === 'input_audio_buffer.speech_stopped' ||
+      eventType === 'input_audio_buffer.committed'
+    ) {
+      console.log('STREAMING STT EVENT:', {
+        callControlId,
+        eventType,
+        itemId: event.item_id ?? '',
+        event,
+      });
+      return;
+    }
+
+    if (eventType === 'conversation.item.input_audio_transcription.delta') {
+      console.log('STREAMING STT DELTA EVENT:', {
+        callControlId,
+        delta: event.delta ?? '',
+        event,
+      });
+      this.handlePartialTranscript(callControlId, session, event.delta ?? '');
+      return;
+    }
+
+    if (eventType === 'conversation.item.input_audio_transcription.completed') {
+      console.log('STREAMING STT COMPLETED EVENT:', {
+        callControlId,
+        transcript: event.transcript ?? '',
+        event,
+      });
+      void this.handleFinalTranscript(callControlId, session, event.transcript ?? '');
+      return;
+    }
+
+    if (eventType === 'error') {
+      console.error('STREAMING STT SERVER ERROR:', {
+        callControlId,
+        error: event.error,
+      });
+      return;
+    }
+
+    console.log('STREAMING STT UNHANDLED EVENT:', {
+      callControlId,
+      eventType,
+      event,
+    });
+  }
+
+  private handlePartialTranscript(
+    callControlId: string,
+    session: StreamingSessionState,
+    text: string,
+  ) {
+    const partial = text.trim();
+
+    if (!partial) {
+      return;
+    }
+
+    session.lastPartialText = partial;
+
+    console.log('STREAMING STT PARTIAL:', {
+      callControlId,
+      partial,
+      isBotSpeaking: session.isBotSpeaking,
+      wasInterruptedByHuman: session.wasInterruptedByHuman,
+      interruptInFlight: session.interruptInFlight,
+    });
+
+    if (!session.isBotSpeaking) {
+      if (!this.canUseFastStart(callControlId, session, partial)) {
+        return;
+      }
+
+      session.fastStartUsed = true;
+      session.fastStartPartialText = this.normalizeText(partial);
+
+      console.log('STREAMING STT FAST START TRIGGERED:', {
+        callControlId,
+        partial,
+        fastStartPartialText: session.fastStartPartialText,
+      });
+
+      void this.handleFastStart(callControlId, session, partial);
+      return;
+    }
+
+    if (partial.length < 2) {
+      console.log('STREAMING STT PARTIAL INTERRUPT IGNORED: too short', {
+        callControlId,
+        partial,
+      });
+      return;
+    }
+
+    const echoReason = this.getEchoReason(callControlId, partial);
+
+    if (echoReason) {
+      console.log('STREAMING STT PARTIAL INTERRUPT IGNORED: echo detected', {
+        callControlId,
+        partial,
+        echoReason,
+      });
+      return;
+    }
+
+    void this.forceInterrupt(callControlId);
+  }
+
+  private async handleFinalTranscript(
+    callControlId: string,
+    session: StreamingSessionState,
+    text: string,
+  ) {
+    const transcript = text.trim();
+    const mode = this.callsService.getCallMode(callControlId);
+
+    console.log('STREAMING STT FINAL RECEIVED:', {
+      callControlId,
+      transcript,
+      mode,
+      isClosing: session.isClosing,
+      isHandlingTurn: session.isHandlingTurn,
+      isBotSpeaking: session.isBotSpeaking,
+      wasInterruptedByHuman: session.wasInterruptedByHuman,
+      pendingFinalText: session.pendingFinalText,
+    });
+
+    if (mode !== 'ai') {
+      console.log('STREAMING STT FINAL IGNORED: mode is not ai', {
+        callControlId,
+        mode,
+      });
+      return;
+    }
+
+    if (session.isClosing) {
+      console.log('STREAMING STT FINAL IGNORED: session closing', {
+        callControlId,
+      });
+      return;
+    }
+
+    if (!transcript || transcript.length < 2) {
+      console.log('STREAMING STT FINAL IGNORED: empty or too short', {
+        callControlId,
+        transcript,
+      });
+      return;
+    }
+
+    const normalizedTranscript = this.normalizeText(transcript);
+
+    if (
+      session.fastStartUsed &&
+      session.fastStartPartialText &&
+      normalizedTranscript &&
+      normalizedTranscript === session.fastStartPartialText
+    ) {
+      session.lastFinalText = transcript;
+      session.fastStartPartialText = '';
+
+      console.log('STREAMING STT FINAL IGNORED: already handled by fast start', {
+        callControlId,
+        transcript,
+      });
+      return;
+    }
+
+    if (transcript === session.lastHandledText) {
+      console.log('STREAMING STT FINAL IGNORED: duplicate lastHandledText', {
+        callControlId,
+        transcript,
+      });
+      return;
+    }
+
+    if (session.isHandlingTurn) {
+      if (transcript !== session.pendingFinalText) {
+        session.pendingFinalText = transcript;
+      }
+
+      console.log('STREAMING STT FINAL QUEUED: turn already handling', {
+        callControlId,
+        transcript,
+        pendingFinalText: session.pendingFinalText,
+      });
+      return;
+    }
+
+    if (transcript === session.lastFinalText) {
+      console.log('STREAMING STT FINAL IGNORED: duplicate lastFinalText', {
+        callControlId,
+        transcript,
+      });
+      return;
+    }
+
+    const echoReason = this.getEchoReason(callControlId, transcript);
+
+    if (echoReason) {
+      session.lastFinalText = transcript;
+
+      console.log('STREAMING STT FINAL IGNORED: echo detected', {
+        callControlId,
+        transcript,
+        echoReason,
+      });
+      return;
+    }
+
+    session.lastFinalText = transcript;
+    session.isHandlingTurn = true;
+    session.wasInterruptedByHuman = false;
+
+    try {
+      const humanMessage = this.callsService.addMessage({
+        callId: callControlId,
+        role: 'human',
+        textEs: transcript,
+        textRu: '',
+      });
+
+      if (!humanMessage) {
+        console.log('STREAMING STT FINAL SKIPPED: callsService rejected message', {
+          callControlId,
+          transcript,
+        });
+        return;
+      }
+
+      await this.aiOperatorService.handleHumanMessage(callControlId);
+
+      const botReplyText = this.getLastBotReplyText(callControlId);
+
+      if (botReplyText) {
+        this.clearBotSpeakingTimeout(session);
+        session.isBotSpeaking = true;
+        session.botSpeakingTimeout = setTimeout(() => {
+          session.isBotSpeaking = false;
+          session.botSpeakingTimeout = null;
+
+          console.log('STREAMING STT BOT SPEAKING TIMEOUT ENDED:', {
+            callControlId,
+          });
+        }, this.estimateBotSpeakingDurationMs(botReplyText));
+      }
+
+      session.lastHandledText = transcript;
+
+      console.log('STREAMING STT FINAL HANDLED:', {
+        callControlId,
+        transcript,
+      });
+    } catch (err) {
+      console.error('STREAMING STT FINAL HANDLE ERROR:', {
+        callControlId,
+        transcript,
+        err,
+      });
+    } finally {
+      session.isHandlingTurn = false;
+
+      const pendingTranscript = session.pendingFinalText.trim();
+
+      if (
+        pendingTranscript &&
+        pendingTranscript !== session.lastHandledText &&
+        pendingTranscript !== session.lastFinalText
+      ) {
+        session.pendingFinalText = '';
+
+        console.log('STREAMING STT FINAL REPLAY PENDING:', {
+          callControlId,
+          pendingTranscript,
+        });
+
+        setTimeout(() => {
+          const currentSession = this.sessions.get(callControlId);
+
+          if (!currentSession || currentSession.isClosing) {
+            return;
+          }
+
+          void this.handleFinalTranscript(callControlId, currentSession, pendingTranscript);
+        }, 0);
+      } else {
+        session.pendingFinalText = '';
+      }
+    }
+  }
+
+
+  private canUseFastStart(
+    callControlId: string,
+    session: StreamingSessionState,
+    partial: string,
+  ): boolean {
+    const mode = this.callsService.getCallMode(callControlId);
+
+    if (mode !== 'ai') {
+      return false;
+    }
+
+    if (session.isClosing || session.fastStartUsed || session.isHandlingTurn) {
+      return false;
+    }
+
+    const messages = this.callsService.getMessagesByCallId(callControlId);
+    const hasConversationStarted = messages.some(
+      message => message.role === 'human' || message.role === 'bot' || message.role === 'operator',
+    );
+
+    if (hasConversationStarted) {
+      return false;
+    }
+
+    const normalizedPartial = this.normalizeText(partial);
+
+    if (!normalizedPartial) {
+      return false;
+    }
+
+    if (normalizedPartial.length < 3 || normalizedPartial.length > 24) {
+      return false;
+    }
+
+    const wordCount = normalizedPartial.split(' ').filter(Boolean).length;
+
+    if (wordCount > 4) {
+      return false;
+    }
+
+    if (!/[a-záéíóúñü]/i.test(normalizedPartial)) {
+      return false;
+    }
+
+    const echoReason = this.getEchoReason(callControlId, partial);
+
+    if (echoReason) {
+      console.log('STREAMING STT FAST START IGNORED: echo detected', {
+        callControlId,
+        partial,
+        echoReason,
+      });
+      return false;
+    }
+
+    return true;
+  }
+
+  private async handleFastStart(
+    callControlId: string,
+    session: StreamingSessionState,
+    partial: string,
+  ) {
+    session.isHandlingTurn = true;
+    session.wasInterruptedByHuman = false;
+
+    const fastStartReplyText = 'Hola, llamo por el anuncio de la vivienda en alquiler.';
+
+    try {
+      const humanMessage = this.callsService.addMessage({
+        callId: callControlId,
+        role: 'human',
+        textEs: partial,
+        textRu: '',
+      });
+
+      if (!humanMessage) {
+        console.log('STREAMING STT FAST START SKIPPED: callsService rejected message', {
+          callControlId,
+          partial,
+        });
+        return;
+      }
+
+      const botMessage = this.callsService.addMessage({
+        callId: callControlId,
+        role: 'bot',
+        textEs: fastStartReplyText,
+        textRu: '',
+      });
+
+      if (!botMessage) {
+        console.log('STREAMING STT FAST START SKIPPED: bot message rejected', {
+          callControlId,
+          partial,
+        });
+        return;
+      }
+
+      await this.sendSpeak(callControlId, fastStartReplyText);
+
+      this.clearBotSpeakingTimeout(session);
+      session.isBotSpeaking = true;
+      session.botSpeakingTimeout = setTimeout(() => {
+        session.isBotSpeaking = false;
+        session.botSpeakingTimeout = null;
+
+        console.log('STREAMING STT BOT SPEAKING TIMEOUT ENDED:', {
+          callControlId,
+        });
+      }, this.estimateBotSpeakingDurationMs(fastStartReplyText));
+
+      session.lastHandledText = partial;
+      session.lastFinalText = partial;
+
+      console.log('STREAMING STT FAST START HANDLED:', {
+        callControlId,
+        partial,
+        replyEs: fastStartReplyText,
+      });
+    } catch (err) {
+      console.error('STREAMING STT FAST START ERROR:', {
+        callControlId,
+        partial,
+        err,
+      });
+    } finally {
+      session.isHandlingTurn = false;
+    }
+  }
+
+  private async sendSpeak(callControlId: string, textEs: string) {
+    const apiKey = process.env.TELNYX_API_KEY;
+
+    if (!apiKey) {
+      throw new Error('TELNYX_API_KEY not set');
+    }
+
+    const response = await fetch(
+      `https://api.telnyx.com/v2/calls/${callControlId}/actions/speak`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          payload: textEs,
+          voice: 'AWS.Polly.Lucia',
+        }),
+      },
+    );
+
+    const responseText = await response.text();
+
+    console.log('STREAMING STT FAST START SPEAK RESPONSE:', {
+      callControlId,
+      status: response.status,
+      body: responseText,
+      textEs,
+    });
+
+    if (!response.ok) {
+      throw new Error(`fast start speak failed: ${response.status}`);
+    }
+  }
+
+  private getEchoReason(callControlId: string, transcript: string): string | null {
+    const normalizedTranscript = this.normalizeText(transcript);
+
+    if (!normalizedTranscript) {
+      return null;
+    }
+
+    const messages = this.callsService.getMessagesByCallId(callControlId);
+    const lastBotMessage = [...messages].reverse().find(message => message.role === 'bot');
+
+    if (!lastBotMessage?.textEs) {
+      return null;
+    }
+
+    const normalizedBotText = this.normalizeText(lastBotMessage.textEs);
+
+    if (!normalizedBotText) {
+      return null;
+    }
+
+    if (normalizedTranscript === normalizedBotText) {
+      return 'exact_match_last_bot_message';
+    }
+
+    if (
+      normalizedTranscript.length >= 6 &&
+      normalizedBotText.includes(normalizedTranscript)
+    ) {
+      return 'transcript_inside_last_bot_message';
+    }
+
+    if (
+      normalizedBotText.length >= 6 &&
+      normalizedTranscript.includes(normalizedBotText)
+    ) {
+      return 'last_bot_message_inside_transcript';
+    }
+
+    return null;
+  }
+
+  private getLastBotReplyText(callControlId: string): string {
+    const messages = this.callsService.getMessagesByCallId(callControlId);
+    const lastBotMessage = [...messages].reverse().find(message => message.role === 'bot');
+
+    return lastBotMessage?.textEs?.trim() ?? '';
+  }
+
+  private normalizeText(text: string): string {
+    return text
+      .toLowerCase()
+      .replace(/[¿?¡!.,:;]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private closeRealtimeSession(
+    callControlId: string,
+    session: StreamingSessionState,
+  ) {
+    const ws = session.ws;
+
+    if (!ws) {
+      return;
+    }
+
+    session.ws = null;
+
+    try {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+      }
+    } catch (err) {
+      console.error('STREAMING STT CLOSE ERROR:', {
+        callControlId,
+        err,
+      });
+    }
+  }
+
+  private clearBotSpeakingTimeout(session: StreamingSessionState) {
+    if (session.botSpeakingTimeout) {
+      clearTimeout(session.botSpeakingTimeout);
+      session.botSpeakingTimeout = null;
+    }
+
+    session.isBotSpeaking = false;
+  }
+
+  private estimateBotSpeakingDurationMs(text: string): number {
+    const baseMs = 1500;
+    const perChunkMs = Math.ceil(text.length / 18) * 1000;
+    const bufferMs = 1000;
+    const rawMs = baseMs + perChunkMs + bufferMs;
+
+    return Math.max(2000, Math.min(9000, rawMs));
+  }
+}

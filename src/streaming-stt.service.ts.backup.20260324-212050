@@ -1,0 +1,77 @@
+import { Injectable } from '@nestjs/common';
+
+interface StreamingSessionState {
+  totalBytes: number;
+  chunkCount: number;
+  isClosing: boolean;
+  startedAt: number;
+  lastChunkAt: number;
+}
+
+@Injectable()
+export class StreamingSttService {
+  private sessions = new Map<string, StreamingSessionState>();
+
+  startSession(callControlId: string) {
+    this.sessions.set(callControlId, {
+      totalBytes: 0,
+      chunkCount: 0,
+      isClosing: false,
+      startedAt: Date.now(),
+      lastChunkAt: 0,
+    });
+
+    console.log('STREAMING STT START SESSION:', callControlId);
+  }
+
+  pushAudio(callControlId: string, chunk: Buffer) {
+    const session = this.sessions.get(callControlId);
+
+    if (!session) {
+      console.log('STREAMING STT PUSH AUDIO: session not found', {
+        callControlId,
+        bytes: chunk.length,
+      });
+      return;
+    }
+
+    if (session.isClosing) {
+      console.log('STREAMING STT PUSH AUDIO: session closing, chunk ignored', {
+        callControlId,
+        bytes: chunk.length,
+      });
+      return;
+    }
+
+    session.totalBytes += chunk.length;
+    session.chunkCount += 1;
+    session.lastChunkAt = Date.now();
+
+    console.log('STREAMING STT PUSH AUDIO:', {
+      callControlId,
+      bytes: chunk.length,
+      totalBytes: session.totalBytes,
+      chunkCount: session.chunkCount,
+    });
+  }
+
+  stopSession(callControlId: string) {
+    const session = this.sessions.get(callControlId);
+
+    if (session) {
+      session.isClosing = true;
+
+      console.log('STREAMING STT STOP SESSION SUMMARY:', {
+        callControlId,
+        totalBytes: session.totalBytes,
+        chunkCount: session.chunkCount,
+        lifetimeMs: Date.now() - session.startedAt,
+        lastChunkAgoMs: session.lastChunkAt ? Date.now() - session.lastChunkAt : null,
+      });
+
+      this.sessions.delete(callControlId);
+    }
+
+    console.log('STREAMING STT STOP SESSION:', callControlId);
+  }
+}

@@ -1,0 +1,32 @@
+import 'reflect-metadata';
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+import { AiService } from './ai.service';
+import { CallsService } from './calls.service';
+import { processRawAudio } from './raw-processor';
+
+async function bootstrap() {
+  const rawPath = process.argv[2];
+  const callControlId = process.argv[3] ?? '';
+
+  if (!rawPath) {
+    console.error('Usage: node dist/raw-runner.js <rawPath> [callControlId]');
+    process.exit(1);
+  }
+
+  const wavPath = rawPath.replace(/\.raw$/, '.wav');
+
+  const app = await NestFactory.createApplicationContext(AppModule);
+  const aiService = app.get(AiService);
+  const callsService = app.get(CallsService);
+
+  try {
+    await processRawAudio(rawPath, wavPath, callControlId, aiService, callsService);
+  } catch (err) {
+    console.error('RAW RUNNER ERROR:', err);
+  } finally {
+    await app.close();
+  }
+}
+
+bootstrap();

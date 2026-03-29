@@ -1,0 +1,62 @@
+import { Body, Controller, Post } from '@nestjs/common';
+import { CallsService, CallStatus, CallDirection } from './calls.service';
+import { ScenarioService } from './scenario.service';
+import { TelnyxService } from './telnyx.service';
+
+@Controller('webhooks')
+export class WebhooksController {
+  constructor(
+    private readonly callsService: CallsService,
+    private readonly scenarioService: ScenarioService,
+    private readonly telnyxService: TelnyxService,
+  ) {}
+
+  @Post('telnyx')
+  async telnyxWebhook(@Body() body: any) {
+    console.log('TELNYX WEBHOOK BODY:', JSON.stringify(body));
+
+    const eventType = body?.data?.event_type;
+    const payload = body?.data?.payload;
+    const callControlId = payload?.call_control_id;
+    const direction = payload?.direction as CallDirection | undefined;
+    const from = payload?.from;
+    const to = payload?.to;
+
+    let status: CallStatus | null = null;
+
+    if (eventType === 'call.initiated') status = 'initiated';
+    if (eventType === 'call.answered') status = 'answered';
+    if (eventType === 'call.hangup') status = 'hangup';
+
+    if (callControlId && status) {
+      const existing = this.callsService.findAll().find((c) => c.id === callControlId);
+
+      this.callsService.upsertCall({
+        id: callControlId,
+        from: from ?? existing?.from ?? '',
+        to: to ?? existing?.to ?? '',
+        direction: direction ?? existing?.direction ?? 'incoming',
+        status,
+      });
+    }
+
+    try {
+      if (eventType === 'call.initiated' && direction === 'incoming' && callControlId) {
+        await this.telnyxService.answerCall(callControlId);
+      }
+
+      if (eventType === 'call.answered' && callControlId) {
+        await this.telnyxService.startStreaming(callControlId);
+        await this.scenarioService.startScenario(callControlId);
+      }
+
+      if (eventType === 'call.speak.ended' && callControlId) {
+        await this.scenarioService.continueScenario(callControlId);
+      }
+    } catch (err) {
+      console.error('TELNYX ERROR:', err);
+    }
+
+    return { ok: true };
+  }
+}

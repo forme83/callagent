@@ -1,0 +1,1 @@
+// Real content file for src/store.service.ts with more detailed content

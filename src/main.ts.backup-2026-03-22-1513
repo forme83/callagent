@@ -1,0 +1,126 @@
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+import { WebSocketServer } from 'ws';
+import { appendFileSync, mkdirSync, writeFileSync } from 'fs';
+import { AiService } from './ai.service';
+import { CallsService } from './calls.service';
+import { AiOperatorService } from './ai-operator.service';
+import { processRawAudio } from './raw-processor';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  app.enableCors({
+    origin: 'http://localhost:3000',
+  });
+
+  app.setGlobalPrefix('api');
+
+  const aiService = app.get(AiService);
+  const callsService = app.get(CallsService);
+  const aiOperatorService = app.get(AiOperatorService);
+
+  const server = app.getHttpServer();
+
+  const wss = new WebSocketServer({
+    server,
+    path: '/api/telnyx-stream',
+  });
+
+  wss.on('connection', (ws, req) => {
+    console.log('WS CONNECTED:', req.url);
+
+    mkdirSync('/opt/callagent/repo/tmp/telnyx-stream', { recursive: true });
+
+    const basePath = `/opt/callagent/repo/tmp/telnyx-stream/${Date.now()}`;
+    const rawPath = `${basePath}.raw`;
+    const wavPath = `${basePath}.wav`;
+
+    let messageCount = 0;
+    let totalBytes = 0;
+    let callControlId = '';
+
+    let liveBuffer = Buffer.alloc(0);
+    const windowSize = 48000;
+    const stepSize = 24000;
+    let liveChunkIndex = 0;
+    let isProcessingLiveChunk = false;
+
+    ws.on('message', (message) => {
+      messageCount += 1;
+
+      const raw = message.toString();
+
+      try {
+        const parsed = JSON.parse(raw);
+
+        if (parsed.event === 'connected' || parsed.event === 'start') {
+          console.log('WS CONTROL EVENT:', JSON.stringify(parsed));
+        }
+
+        if (parsed.event === 'start' && parsed.start?.call_control_id) {
+          callControlId = parsed.start.call_control_id;
+        }
+
+        if (parsed.event === 'media' && parsed.media?.payload) {
+          const chunk = Buffer.from(parsed.media.payload, 'base64');
+          appendFileSync(rawPath, chunk);
+          totalBytes += chunk.length;
+          liveBuffer = Buffer.concat([liveBuffer, chunk]);
+
+          if (!isProcessingLiveChunk && liveBuffer.length >= windowSize) {
+            isProcessingLiveChunk = true;
+
+            const liveChunk = liveBuffer.slice(0, windowSize);
+            const chunkRawPath = `${basePath}.live-${liveChunkIndex}.raw`;
+            const chunkWavPath = `${basePath}.live-${liveChunkIndex}.wav`;
+
+            writeFileSync(chunkRawPath, liveChunk);
+
+            processRawAudio(
+              chunkRawPath,
+              chunkWavPath,
+              callControlId,
+              aiService,
+              callsService,
+              aiOperatorService,
+            )
+              .catch((err) => {
+                console.error('LIVE CHUNK ERROR:', err);
+              })
+              .finally(() => {
+                liveBuffer = liveBuffer.slice(stepSize);
+                liveChunkIndex += 1;
+                isProcessingLiveChunk = false;
+              });
+          }
+        }
+      } catch {}
+    });
+
+    ws.on('close', async () => {
+      console.log('WS CLOSED');
+      console.log('WS RAW FILE SAVED:', { rawPath, totalBytes });
+
+      try {
+        await processRawAudio(
+          rawPath,
+          wavPath,
+          callControlId,
+          aiService,
+          callsService,
+          aiOperatorService,
+        );
+      } catch (err) {
+        console.error('POST-PROCESS ERROR:', err);
+      }
+    });
+
+    ws.on('error', (err) => {
+      console.error('WS ERROR:', err);
+    });
+  });
+
+  await app.listen(process.env.PORT ?? 3000);
+}
+bootstrap();

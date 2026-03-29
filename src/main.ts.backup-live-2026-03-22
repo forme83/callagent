@@ -1,0 +1,85 @@
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+import { WebSocketServer } from 'ws';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import fetch from 'node-fetch';
+import FormData from 'form-data';
+import { AiService } from './ai.service';
+import { CallsService } from './calls.service';
+import { processRawAudio } from './raw-processor';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  app.enableCors({
+    origin: 'http://localhost:3000',
+  });
+
+  app.setGlobalPrefix('api');
+
+  const aiService = app.get(AiService);
+  const callsService = app.get(CallsService);
+
+  const server = app.getHttpServer();
+
+  const wss = new WebSocketServer({
+    server,
+    path: '/api/telnyx-stream',
+  });
+
+  wss.on('connection', (ws, req) => {
+    console.log('WS CONNECTED:', req.url);
+
+    mkdirSync('/opt/callagent/repo/tmp/telnyx-stream', { recursive: true });
+
+    const basePath = `/opt/callagent/repo/tmp/telnyx-stream/${Date.now()}`;
+    const rawPath = `${basePath}.raw`;
+    const wavPath = `${basePath}.wav`;
+
+    let messageCount = 0;
+    let totalBytes = 0;
+    let callControlId = '';
+
+    ws.on('message', (message) => {
+      messageCount += 1;
+
+      const raw = message.toString();
+
+      try {
+        const parsed = JSON.parse(raw);
+
+        if (parsed.event === 'connected' || parsed.event === 'start') {
+          console.log('WS CONTROL EVENT:', JSON.stringify(parsed));
+        }
+
+        if (parsed.event === 'start' && parsed.start?.call_control_id) {
+          callControlId = parsed.start.call_control_id;
+        }
+
+        if (parsed.event === 'media' && parsed.media?.payload) {
+          const chunk = Buffer.from(parsed.media.payload, 'base64');
+          appendFileSync(rawPath, chunk);
+          totalBytes += chunk.length;
+        }
+      } catch {}
+    });
+
+    ws.on('close', async () => {
+      console.log('WS CLOSED');
+      console.log('WS RAW FILE SAVED:', { rawPath, totalBytes });
+
+      try {
+        await processRawAudio(rawPath, wavPath, callControlId, aiService, callsService);
+      } catch (err) {
+        console.error('POST-PROCESS ERROR:', err);
+      }
+    });
+
+    ws.on('error', (err) => {
+      console.error('WS ERROR:', err);
+    });
+  });
+
+  await app.listen(process.env.PORT ?? 3000);
+}
+bootstrap();

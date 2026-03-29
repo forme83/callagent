@@ -1,0 +1,1 @@
+// Real content file for src/types.ts with more detailed content

@@ -1,0 +1,27 @@
+{
+  "name": "final_correct_project_v1",
+  "version": "1.0.0",
+  "description": "Project with real content",
+  "main": "src/main.ts",
+  "scripts": {
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@nestjs/core": "^11.1.17",
+    "@nestjs/platform-express": "^11.1.17",
+    "node-fetch": "^2.7.0",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "^11.1.17",
+    "@types/jest": "^30.0.0",
+    "@types/mocha": "^10.0.10",
+    "supertest": "^7.2.2",
+    "ts-loader": "^9.5.4",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3",
+    "webpack": "^5.0.0"
+  },
+  "author": "AI Project",
+  "license": "MIT"
+}
